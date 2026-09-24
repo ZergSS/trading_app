@@ -6,13 +6,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
-	"finam-dashboard/internal/bybit"
-	"finam-dashboard/internal/config"
-	"finam-dashboard/internal/finam"
-	"finam-dashboard/internal/storage"
-	"finam-dashboard/internal/volatility"
+	"trade_info/internal/bybit"
+	"trade_info/internal/config"
+	"trade_info/internal/finam"
+	"trade_info/internal/storage"
+	"trade_info/internal/volatility"
 )
 
 type App struct {
@@ -158,7 +159,7 @@ func (a *App) updateInstrument(category, ticker string) {
 
 	_ = a.storage.SaveVolatility(ticker, vol, lastClose)
 
-	tview.QueueUpdateDraw(func() {
+	a.tviewApp.QueueUpdateDraw(func() {
 		table := a.tables[category]
 		if table == nil {
 			table = a.tables["other"]
@@ -191,7 +192,7 @@ func (a *App) performSearch(query string) {
 		}
 	}
 
-	// Проверяем Finam
+	// Проверяем Finam (заглушка)
 	symbols, err := a.finamClient.Search(context.Background(), query)
 	if err == nil {
 		for _, s := range symbols {
@@ -243,7 +244,7 @@ func (a *App) addInstrument(ticker, category string) {
 }
 
 func (a *App) showError(msg string) {
-	tview.QueueUpdateDraw(func() {
+	a.tviewApp.QueueUpdateDraw(func() {
 		modal := tview.NewModal().
 			SetText(msg).
 			AddButtons([]string{"OK"}).

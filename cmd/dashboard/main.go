@@ -3,8 +3,8 @@ package main
 import (
 	"log"
 
-	"finam-dashboard/internal/config"
-	"finam-dashboard/internal/ui"
+	"trade_info/internal/config"
+	"trade_info/internal/ui"
 )
 
 func main() {

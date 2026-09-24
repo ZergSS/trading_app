@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 
+	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
@@ -11,11 +12,12 @@ func newTable(title string) *tview.Table {
 	table.SetBorder(true).SetTitle(title)
 	table.SetFixed(1, 0)
 	table.SetSelectable(true, false)
-	table.SetHeader(
-		tview.NewTableCell("Тикер").SetExpansion(1),
-		tview.NewTableCell("% волатильности").SetAlign(tview.AlignRight),
-		tview.NewTableCell("Торг").SetAlign(tview.AlignCenter),
-	)
+
+	// Заголовки
+	table.SetCell(0, 0, tview.NewTableCell("Тикер").SetExpansion(1))
+	table.SetCell(0, 1, tview.NewTableCell("% волатильности").SetAlign(tview.AlignRight))
+	table.SetCell(0, 2, tview.NewTableCell("Торг").SetAlign(tview.AlignCenter))
+
 	return table
 }
 
