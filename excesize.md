@@ -22,3 +22,33 @@
 задача 3 - расчет % волатильности и отображение таблиц
 сборка в github action и доставка (исполняемый файл для линукс и windows) для каждой задачи: что сделать и как - я проверю 3 Каркас проекта на Go: структура, точки входа, README.md 4 Файл AGENT.md - правила проекта: маленькие шаги, тесты обязателно, токен только из .env 5 первый коммит в git
 В конце расскажи что поучилось
+
+finam-dashboard/
+├── .env
+├── .gitignore
+├── README.md
+├── SPEC.md
+├── TASK.md
+├── AGENT.md
+├── go.mod
+├── cmd/
+│   └── dashboard/
+│       └── main.go
+├── internal/
+│   ├── config/
+│   │   └── config.go
+│   ├── finam/
+│   │   └── client.go
+│   ├── bybit/
+│   │   └── client.go
+│   ├── volatility/
+│   │   ├── calculator.go
+│   │   └── calculator_test.go
+│   ├── storage/
+│   │   └── storage.go
+│   └── ui/
+│       ├── app.go
+│       └── widgets.go
+└── .github/
+    └── workflows/
+        └── build.yml

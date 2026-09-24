@@ -1,0 +1,41 @@
+package ui
+
+import (
+	"fmt"
+
+	"github.com/rivo/tview"
+)
+
+func newTable(title string) *tview.Table {
+	table := tview.NewTable()
+	table.SetBorder(true).SetTitle(title)
+	table.SetFixed(1, 0)
+	table.SetSelectable(true, false)
+	table.SetHeader(
+		tview.NewTableCell("Тикер").SetExpansion(1),
+		tview.NewTableCell("% волатильности").SetAlign(tview.AlignRight),
+		tview.NewTableCell("Торг").SetAlign(tview.AlignCenter),
+	)
+	return table
+}
+
+func tradeText(vol float64) (string, tcell.Color) {
+	switch {
+	case vol < 1.0:
+		return "не торгуем", tcell.ColorRed
+	case vol < 1.5:
+		return "можно попытаться", tcell.ColorOrange
+	case vol < 3.0:
+		return "торгуем точно", tcell.ColorGreen
+	default:
+		return "торгуем осторожно", tcell.ColorPurple
+	}
+}
+
+func updateTableRow(table *tview.Table, ticker string, vol float64) {
+	row := table.GetRowCount()
+	table.SetCell(row, 0, tview.NewTableCell(ticker))
+	table.SetCell(row, 1, tview.NewTableCell(fmt.Sprintf("%.2f%%", vol)).SetAlign(tview.AlignRight))
+	text, color := tradeText(vol)
+	table.SetCell(row, 2, tview.NewTableCell(text).SetTextColor(color).SetAlign(tview.AlignCenter))
+}

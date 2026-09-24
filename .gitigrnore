@@ -3,3 +3,4 @@ excesize.md
 .env
 *.db
 /bin/
+AGENT.md
