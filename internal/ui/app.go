@@ -3,7 +3,10 @@ package ui
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -25,11 +28,17 @@ type App struct {
 	bybitClient *bybit.Client
 	storage     *storage.Storage
 
-	tables map[string]*tview.Table
-	search *tview.InputField
-	status *tview.TextView
+	tables       map[string]*tview.Table
+	search       *tview.InputField
+	status       *tview.TextView
+	searchTimer  *tview.TextView
+	searchCancel context.CancelFunc
+
+	categories  []string
+	activeIndex int
 
 	instruments map[string][]string
+	rows        map[string]map[string]int
 }
 
 type SearchResult struct {
@@ -40,15 +49,14 @@ type SearchResult struct {
 
 func NewApp(cfg *config.Config) *App {
 	a := &App{
-		tviewApp: tview.NewApplication(),
-		cfg:      cfg,
-		pages:    tview.NewPages(),
-		tables:   make(map[string]*tview.Table),
-		instruments: map[string][]string{
-			"coins":  {"BTCUSDT", "ETHUSDT"},
-			"stocks": {"SBER", "GAZP"},
-			"bonds":  {"SU26238RMFS5"},
-		},
+		tviewApp:    tview.NewApplication(),
+		cfg:         cfg,
+		pages:       tview.NewPages(),
+		tables:      make(map[string]*tview.Table),
+		instruments: map[string][]string{},
+		rows:        make(map[string]map[string]int),
+		categories:  []string{"coins", "stocks", "bonds", "other"},
+		activeIndex: 0,
 	}
 
 	a.finamClient = finam.NewClient(cfg.FinamToken)
@@ -63,8 +71,34 @@ func NewApp(cfg *config.Config) *App {
 		panic(fmt.Sprintf("Ошибка инициализации хранилища: %v", err))
 	}
 
+	a.loadSavedInstruments()
+
 	a.buildUI()
 	return a
+}
+
+// loadSavedInstruments восстанавливает ранее добавленные тикеры из БД.
+func (a *App) loadSavedInstruments() {
+	items, err := a.storage.LoadInstruments()
+	if err != nil {
+		return // таблицы просто останутся пустыми
+	}
+	for _, it := range items {
+		cat := it.Type
+		if !containsString(a.categories, cat) {
+			cat = "other"
+		}
+		a.instruments[cat] = append(a.instruments[cat], it.Ticker)
+	}
+}
+
+func containsString(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) Run() error {
@@ -77,9 +111,19 @@ func (a *App) Run() error {
 		a.status.SetText("Finam: OK")
 	}
 
-	a.refreshData()
-	go a.autoRefresh()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	go func() {
+		<-sigCh
+		if a.searchCancel != nil {
+			a.searchCancel()
+		}
+		a.tviewApp.Stop()
+	}()
 
+	// Автообновление данных отключено по требованию.
+	// При добавлении нового тикера обновление выполняется только для этого инструмента.
 	return a.tviewApp.Run()
 }
 
@@ -97,8 +141,12 @@ func (a *App) buildUI() {
 	grid.AddItem(a.tables["other"], 0, 3, 1, 1, 0, 0, true)
 
 	a.search = tview.NewInputField().
-		SetLabel("Поиск: ").
-		SetPlaceholder("тикер или название").
+		SetLabel("Добавить тикер: ").
+		SetPlaceholder("например SBER@TQBR").
+		SetFieldTextColor(tcell.ColorWhite).
+		SetFieldBackgroundColor(tcell.NewRGBColor(12, 28, 38)).
+		SetPlaceholderTextColor(tcell.ColorDarkGray).
+		SetLabelColor(tcell.ColorLightGreen).
 		SetDoneFunc(func(key tcell.Key) {
 			if key == tcell.KeyEnter {
 				query := strings.TrimSpace(a.search.GetText())
@@ -109,32 +157,74 @@ func (a *App) buildUI() {
 		})
 
 	a.status = tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignLeft)
+	a.status.SetText("Готово")
+	a.status.SetTextColor(tcell.ColorLightSkyBlue)
+	a.status.SetBackgroundColor(tcell.NewRGBColor(12, 28, 38))
 
-	bottom := tview.NewFlex().SetDirection(tview.FlexColumn).
-		AddItem(a.search, 0, 3, true).
-		AddItem(a.status, 0, 1, false)
+	a.searchTimer = tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignRight)
+	a.searchTimer.SetText("Поиск: 0.0s")
+	a.searchTimer.SetTextColor(tcell.ColorLightGreen)
+	a.searchTimer.SetBackgroundColor(tcell.NewRGBColor(12, 28, 38))
+
+	bottom := tview.NewFlex().SetDirection(tview.FlexColumn)
+	bottom.SetBackgroundColor(tcell.NewRGBColor(12, 28, 38))
+	bottom.AddItem(a.search, 0, 5, true)
+	bottom.AddItem(a.status, 14, 0, false)
+	bottom.AddItem(a.searchTimer, 16, 0, false)
 
 	grid.AddItem(bottom, 1, 0, 1, 4, 0, 0, false)
 
 	a.pages.AddPage("main", grid, true, true)
 
+	a.activate(a.activeIndex)
+
 	a.tviewApp.SetRoot(a.pages, true).
 		SetFocus(a.search).
 		SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-			if event.Key() == tcell.KeyF5 {
-				a.refreshData()
+			switch event.Key() {
+			case tcell.KeyCtrlC:
+				if a.searchCancel != nil {
+					a.searchCancel()
+				}
+				a.tviewApp.Stop()
+				return nil
+			case tcell.KeyF5:
+				// Автообновление и ручное F5 отключены.
+				a.activateNext()
+				return nil
 			}
 			return event
 		})
 }
 
-func (a *App) refreshData() {
-	a.status.SetText("Обновление...")
-	for category, tickers := range a.instruments {
-		for _, ticker := range tickers {
-			go a.updateInstrument(category, ticker)
-		}
+// activate выделяет активный раздел рамкой и настраивает строку поиска.
+func (a *App) activate(i int) {
+	if i < 0 {
+		i = len(a.categories) - 1
 	}
+	if i >= len(a.categories) {
+		i = 0
+	}
+	a.activeIndex = i
+
+	for idx, cat := range a.categories {
+		color := tcell.ColorGray
+		if idx == i {
+			color = tcell.ColorGreen
+		}
+		a.tables[cat].SetBorderColor(color)
+	}
+
+	a.search.SetLabel("Добавить тикер [" + a.categories[i] + "]: ")
+}
+
+func (a *App) activateNext() { a.activate(a.activeIndex + 1) }
+
+func (a *App) activatePrev() { a.activate(a.activeIndex - 1) }
+
+func (a *App) refreshData() {
+	// Обновление данных отключено глобально.
+	a.status.SetText("Обновление отключено")
 }
 
 func (a *App) updateInstrument(category, ticker string) {
@@ -163,57 +253,112 @@ func (a *App) updateInstrument(category, ticker string) {
 		table := a.tables[category]
 		if table == nil {
 			table = a.tables["other"]
+			category = "other"
 		}
-		updateTableRow(table, ticker, vol)
+		if a.rows[category] == nil {
+			a.rows[category] = make(map[string]int)
+		}
+		row, ok := a.rows[category][ticker]
+		if !ok {
+			row = table.GetRowCount()
+			a.rows[category][ticker] = row
+		}
+		setTableRow(table, row, ticker, vol)
 		a.status.SetText("Готово")
 	})
 }
 
 func (a *App) autoRefresh() {
-	interval := time.Duration(a.cfg.UpdateInterval) * time.Second
-	for {
-		time.Sleep(interval)
-		a.refreshData()
-	}
+	// Автообновление данных отключено.
+	return
 }
 
 func (a *App) performSearch(query string) {
-	var results []SearchResult
-
-	// Проверяем Bybit (если похоже на тикер USDT)
-	if strings.Contains(strings.ToUpper(query), "USDT") {
-		candles, err := a.bybitClient.GetCandles(context.Background(), strings.ToUpper(query), a.cfg.VolatilityPeriod)
-		if err == nil && len(candles) > 0 {
-			results = append(results, SearchResult{
-				Ticker:   strings.ToUpper(query),
-				Name:     query,
-				Category: "coins",
-			})
-		}
-	}
-
-	// Проверяем Finam (заглушка)
-	symbols, err := a.finamClient.Search(context.Background(), query)
-	if err == nil {
-		for _, s := range symbols {
-			results = append(results, SearchResult{
-				Ticker:   s.Ticker,
-				Name:     s.Name,
-				Category: s.Category,
-			})
-		}
-	}
-
-	if len(results) == 0 {
-		a.showError("Ничего не найдено")
+	query = strings.TrimSpace(query)
+	if query == "" {
 		return
 	}
 
-	a.showSearchResults(results)
+	searchCtx, cancel := context.WithCancel(context.Background())
+	a.searchCancel = cancel
+
+	startedAt := time.Now()
+	a.status.SetText("Поиск")
+	a.searchTimer.SetText("Поиск: 0.0s")
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				delta := time.Since(startedAt)
+				a.tviewApp.QueueUpdateDraw(func() {
+					a.searchTimer.SetText(fmt.Sprintf("Поиск: %.1fs", delta.Seconds()))
+				})
+			case <-done:
+				return
+			case <-searchCtx.Done():
+				a.tviewApp.QueueUpdateDraw(func() {
+					a.status.SetText("Отменено")
+					a.searchTimer.SetText("Поиск: 0.0s")
+				})
+				return
+			}
+		}
+	}()
+
+	go func(q string) {
+		defer func() {
+			close(done)
+			a.searchCancel = nil
+		}()
+
+		var results []SearchResult
+
+		if a.categories[a.activeIndex] == "coins" {
+			candles, err := a.bybitClient.GetCandles(searchCtx, strings.ToUpper(q), a.cfg.VolatilityPeriod)
+			if err == nil && len(candles) > 0 {
+				results = append(results, SearchResult{
+					Ticker:   strings.ToUpper(q),
+					Name:     q,
+					Category: "coins",
+				})
+			}
+		} else {
+			symbols, err := a.finamClient.Search(searchCtx, q)
+			if err == nil {
+				for _, s := range symbols {
+					results = append(results, SearchResult{
+						Ticker:   s.Ticker,
+						Name:     s.Name,
+						Category: s.Category,
+					})
+				}
+			}
+		}
+
+		a.tviewApp.QueueUpdateDraw(func() {
+			a.status.SetText("Готово")
+			a.searchTimer.SetText("Поиск: 0.0s")
+			if len(results) == 0 {
+				a.showError("Ничего не найдено")
+				return
+			}
+			a.showSearchResults(results)
+		})
+	}(query)
 }
 
 func (a *App) showSearchResults(results []SearchResult) {
 	list := tview.NewList()
+	list.SetMainTextColor(tcell.ColorBlack)
+	list.SetSecondaryTextColor(tcell.ColorBlack)
+	list.SetBackgroundColor(tcell.ColorWhite)
+	list.SetBorder(true)
+	list.SetTitle("Результаты поиска")
+	list.SetRect(10, 4, 100, 18)
 	for _, r := range results {
 		r := r
 		list.AddItem(
@@ -222,24 +367,29 @@ func (a *App) showSearchResults(results []SearchResult) {
 			func() {
 				a.addInstrument(r.Ticker, r.Category)
 				a.pages.RemovePage("search")
+				a.tviewApp.SetFocus(a.search)
 			},
 		)
 	}
 	list.AddItem("Отмена", "", 0, func() {
 		a.pages.RemovePage("search")
+		a.tviewApp.SetFocus(a.search)
 	})
 
-	modal := tview.NewFlex().AddItem(list, 0, 1, true)
-	modal.SetBorder(true).SetTitle("Результаты поиска")
-
-	a.pages.AddPage("search", modal, true, true)
+	a.pages.AddPage("search", list, true, true)
 }
 
 func (a *App) addInstrument(ticker, category string) {
 	if _, ok := a.tables[category]; !ok {
 		category = "other"
 	}
+	for _, t := range a.instruments[category] {
+		if t == ticker {
+			return
+		}
+	}
 	a.instruments[category] = append(a.instruments[category], ticker)
+	_ = a.storage.SaveInstrument(storage.Instrument{Ticker: ticker, Name: ticker, Type: category})
 	go a.updateInstrument(category, ticker)
 }
 
@@ -247,9 +397,13 @@ func (a *App) showError(msg string) {
 	a.tviewApp.QueueUpdateDraw(func() {
 		modal := tview.NewModal().
 			SetText(msg).
+			SetTextColor(tcell.ColorBlack).
+			SetBackgroundColor(tcell.ColorWhite).
+			SetButtonTextColor(tcell.ColorBlack).
 			AddButtons([]string{"OK"}).
 			SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 				a.pages.RemovePage("error")
+				a.tviewApp.SetFocus(a.search)
 			})
 		a.pages.AddPage("error", modal, true, true)
 	})

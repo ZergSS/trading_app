@@ -48,6 +48,39 @@ func (s *Storage) SaveVolatility(ticker string, vol, price float64) error {
 	return err
 }
 
+// Instrument — найденный инструмент (тип = категория таблицы).
+type Instrument struct {
+	Ticker string
+	Name   string
+	Type   string
+}
+
+func (s *Storage) SaveInstrument(instr Instrument) error {
+	_, err := s.db.Exec(
+		"INSERT INTO instruments (ticker, name, type) VALUES (?, ?, ?) ON CONFLICT(ticker) DO NOTHING",
+		instr.Ticker, instr.Name, instr.Type,
+	)
+	return err
+}
+
+func (s *Storage) LoadInstruments() ([]Instrument, error) {
+	rows, err := s.db.Query("SELECT ticker, name, type FROM instruments")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Instrument
+	for rows.Next() {
+		var i Instrument
+		if err := rows.Scan(&i.Ticker, &i.Name, &i.Type); err != nil {
+			return nil, err
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
 func (s *Storage) Close() error {
 	return s.db.Close()
 }

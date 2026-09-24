@@ -34,9 +34,8 @@ func tradeText(vol float64) (string, tcell.Color) {
 	}
 }
 
-func updateTableRow(table *tview.Table, ticker string, vol float64) {
-	row := table.GetRowCount()
-	table.SetCell(row, 0, tview.NewTableCell(ticker))
+func setTableRow(table *tview.Table, row int, ticker string, vol float64) {
+	table.SetCell(row, 0, tview.NewTableCell(ticker).SetExpansion(1))
 	table.SetCell(row, 1, tview.NewTableCell(fmt.Sprintf("%.2f%%", vol)).SetAlign(tview.AlignRight))
 	text, color := tradeText(vol)
 	table.SetCell(row, 2, tview.NewTableCell(text).SetTextColor(color).SetAlign(tview.AlignCenter))
