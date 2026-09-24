@@ -1,2 +1,5 @@
 .*
 excesize.md
+.env
+*.db
+/bin/
