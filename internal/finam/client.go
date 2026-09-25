@@ -174,3 +174,21 @@ func classifyAsset(rawType string) string {
 		return "OTHER"
 	}
 }
+
+// Connect для совместимости с инициализацией UI
+func (c *Client) Connect() error {
+	if c.conn == nil {
+		return fmt.Errorf("finam grpc connection is not initialized")
+	}
+	return nil
+}
+
+// GetCandles — алиас к GetDailyCandles
+func (c *Client) GetCandles(ctx context.Context, symbol string, count int) ([]Candle, error) {
+	return c.GetDailyCandles(ctx, symbol, count)
+}
+
+// Search — алиас к SearchInstruments
+func (c *Client) Search(ctx context.Context, query string) ([]InstrumentInfo, error) {
+	return c.SearchInstruments(ctx, query)
+}

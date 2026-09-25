@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 	"strings"
@@ -59,10 +60,13 @@ func NewApp(cfg *config.Config) *App {
 		activeIndex: 0,
 	}
 
-	a.finamClient = finam.NewClient(cfg.FinamToken)
+	var err error
+	a.finamClient, err = finam.NewClient(cfg.FinamToken)
+	if err != nil {
+		log.Printf("finam client init error: %v", err)
+	}
 	a.bybitClient = bybit.NewClient()
 
-	var err error
 	a.storage, err = storage.New(cfg.DBPath)
 	if err != nil {
 		panic(fmt.Sprintf("Ошибка создания хранилища: %v", err))
@@ -72,16 +76,14 @@ func NewApp(cfg *config.Config) *App {
 	}
 
 	a.loadSavedInstruments()
-
 	a.buildUI()
 	return a
 }
 
-// loadSavedInstruments восстанавливает ранее добавленные тикеры из БД.
 func (a *App) loadSavedInstruments() {
 	items, err := a.storage.LoadInstruments()
 	if err != nil {
-		return // таблицы просто останутся пустыми
+		return
 	}
 	for _, it := range items {
 		cat := it.Type
@@ -102,10 +104,8 @@ func containsString(list []string, s string) bool {
 }
 
 func (a *App) Run() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := a.finamClient.Connect(ctx); err != nil {
+	// Connect без передачи ctx
+	if err := a.finamClient.Connect(); err != nil {
 		a.showError(fmt.Sprintf("Не удалось подключиться к Finam API: %v", err))
 	} else {
 		a.status.SetText("Finam: OK")
@@ -122,8 +122,6 @@ func (a *App) Run() error {
 		a.tviewApp.Stop()
 	}()
 
-	// Автообновление данных отключено по требованию.
-	// При добавлении нового тикера обновление выполняется только для этого инструмента.
 	return a.tviewApp.Run()
 }
 
@@ -189,7 +187,6 @@ func (a *App) buildUI() {
 				a.tviewApp.Stop()
 				return nil
 			case tcell.KeyF5:
-				// Автообновление и ручное F5 отключены.
 				a.activateNext()
 				return nil
 			}
@@ -197,7 +194,6 @@ func (a *App) buildUI() {
 		})
 }
 
-// activate выделяет активный раздел рамкой и настраивает строку поиска.
 func (a *App) activate(i int) {
 	if i < 0 {
 		i = len(a.categories) - 1
@@ -223,7 +219,6 @@ func (a *App) activateNext() { a.activate(a.activeIndex + 1) }
 func (a *App) activatePrev() { a.activate(a.activeIndex - 1) }
 
 func (a *App) refreshData() {
-	// Обновление данных отключено глобально.
 	a.status.SetText("Обновление отключено")
 }
 
@@ -234,13 +229,40 @@ func (a *App) updateInstrument(category, ticker string) {
 
 	switch category {
 	case "coins":
-		candles, err = a.bybitClient.GetCandles(ctx, ticker, a.cfg.VolatilityPeriod)
+		var bybitCandles []bybit.Candle
+		bybitCandles, err = a.bybitClient.GetCandles(ctx, ticker, a.cfg.VolatilityPeriod)
+		if err == nil {
+			for _, c := range bybitCandles {
+				candles = append(candles, volatility.Candle{
+					Open:  c.Open,
+					High:  c.High,
+					Low:   c.Low,
+					Close: c.Close,
+				})
+			}
+		}
 	default:
-		candles, err = a.finamClient.GetCandles(ctx, ticker, a.cfg.VolatilityPeriod)
+		var finamCandles []finam.Candle
+		finamCandles, err = a.finamClient.GetCandles(ctx, ticker, a.cfg.VolatilityPeriod)
+		if err == nil {
+			for _, c := range finamCandles {
+				candles = append(candles, volatility.Candle{
+					Open:  c.Open,
+					High:  c.High,
+					Low:   c.Low,
+					Close: c.Close,
+				})
+			}
+		}
 	}
 
 	if err != nil {
 		a.showError(fmt.Sprintf("Ошибка при загрузке %s: %v", ticker, err))
+		return
+	}
+
+	if len(candles) == 0 {
+		a.showError(fmt.Sprintf("Нет данных по инструменту %s", ticker))
 		return
 	}
 
@@ -269,7 +291,6 @@ func (a *App) updateInstrument(category, ticker string) {
 }
 
 func (a *App) autoRefresh() {
-	// Автообновление данных отключено.
 	return
 }
 
@@ -330,10 +351,12 @@ func (a *App) performSearch(query string) {
 			symbols, err := a.finamClient.Search(searchCtx, q)
 			if err == nil {
 				for _, s := range symbols {
+					// Преобразуем STOCK / BOND / OTHER к ключам наших таблиц
+					cat := mapFinamTypeToCategory(s.Type)
 					results = append(results, SearchResult{
 						Ticker:   s.Ticker,
 						Name:     s.Name,
-						Category: s.Category,
+						Category: cat,
 					})
 				}
 			}
@@ -349,6 +372,17 @@ func (a *App) performSearch(query string) {
 			a.showSearchResults(results)
 		})
 	}(query)
+}
+
+func mapFinamTypeToCategory(finamType string) string {
+	switch strings.ToUpper(finamType) {
+	case "STOCK":
+		return "stocks"
+	case "BOND":
+		return "bonds"
+	default:
+		return "other"
+	}
 }
 
 func (a *App) showSearchResults(results []SearchResult) {
