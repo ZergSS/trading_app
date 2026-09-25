@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -38,8 +39,9 @@ type App struct {
 	categories  []string
 	activeIndex int
 
-	instruments map[string][]string
-	rows        map[string]map[string]int
+	instruments  map[string][]string
+	names        map[string]string
+	volatilities map[string]float64
 }
 
 type SearchResult struct {
@@ -50,14 +52,15 @@ type SearchResult struct {
 
 func NewApp(cfg *config.Config) *App {
 	a := &App{
-		tviewApp:    tview.NewApplication(),
-		cfg:         cfg,
-		pages:       tview.NewPages(),
-		tables:      make(map[string]*tview.Table),
-		instruments: map[string][]string{},
-		rows:        make(map[string]map[string]int),
-		categories:  []string{"coins", "stocks", "bonds", "other"},
-		activeIndex: 0,
+		tviewApp:     tview.NewApplication(),
+		cfg:          cfg,
+		pages:        tview.NewPages(),
+		tables:       make(map[string]*tview.Table),
+		instruments:  make(map[string][]string),
+		names:        make(map[string]string),
+		volatilities: make(map[string]float64),
+		categories:   []string{"coins", "stocks"},
+		activeIndex:  0,
 	}
 
 	a.finamClient = finam.NewClient(cfg.FinamToken)
@@ -79,15 +82,91 @@ func NewApp(cfg *config.Config) *App {
 
 func (a *App) loadSavedInstruments() {
 	items, err := a.storage.LoadInstruments()
-	if err != nil {
+	if err == nil && len(items) > 0 {
+		for _, it := range items {
+			cat := it.Type
+			if !containsString(a.categories, cat) {
+				continue
+			}
+			a.instruments[cat] = append(a.instruments[cat], it.Ticker)
+			if it.Name != "" {
+				a.names[it.Ticker] = it.Name
+			}
+		}
 		return
 	}
-	for _, it := range items {
-		cat := it.Type
-		if !containsString(a.categories, cat) {
-			cat = "other"
-		}
-		a.instruments[cat] = append(a.instruments[cat], it.Ticker)
+
+	defaultCoins := []string{
+		"BTCUSDT",
+		"ETHUSDT",
+		"SOLUSDT",
+		"TONUSDT",
+		"XRPUSDT",
+		"DOGEUSDT",
+		"LTCUSDT",
+		"NEARUSDT",
+		"ARUSDT",
+		"HYPEUSDT",
+		"BCHUSDT",
+		"ARBUSDT",
+		"1000PEPEUSDT",
+		"UNIUSDT",
+	}
+
+	defaultStocks := []struct {
+		Ticker string
+		Name   string
+	}{
+		{Ticker: "SBER", Name: "Сбербанк"},
+		{Ticker: "GAZP", Name: "Газпром"},
+		{Ticker: "LKOH", Name: "Лукойл"},
+		{Ticker: "GMKN", Name: "ГМК Норильский Никель"},
+		{Ticker: "NVTK", Name: "Новатэк"},
+		{Ticker: "ROSN", Name: "Роснефть"},
+		{Ticker: "YDEX", Name: "Яндекс"},
+		{Ticker: "MTSS", Name: "МТС"},
+		{Ticker: "TATN", Name: "Татнефть"},
+		{Ticker: "VTBR", Name: "ВТБ"},
+		{Ticker: "SNGS", Name: "Сургутнефтегаз"},
+		{Ticker: "CHMF", Name: "Северсталь"},
+		{Ticker: "PLZL", Name: "Полюс"},
+		{Ticker: "ALRS", Name: "Алроса"},
+		{Ticker: "MOEX", Name: "Московская биржа"},
+		{Ticker: "TCSG", Name: "Т-Банк (Тинькофф)"},
+		{Ticker: "AFKS", Name: "АФК Система"},
+		{Ticker: "FIVE", Name: "X5 Retail Group"},
+		{Ticker: "HYDR", Name: "РусГидро"},
+		{Ticker: "RUAL", Name: "Русал"},
+		{Ticker: "SNGSP", Name: "Сургутнефтегаз преф."},
+		{Ticker: "MAGN", Name: "ММК"},
+		{Ticker: "IRAO", Name: "Интер РАО"},
+		{Ticker: "PHOR", Name: "ФосАгро"},
+		{Ticker: "TATNP", Name: "Татнефть преф."},
+		{Ticker: "LSRG", Name: "Группа ЛСР"},
+		{Ticker: "NLMK", Name: "НЛМК"},
+		{Ticker: "POLY", Name: "Полиметалл"},
+		{Ticker: "RASP", Name: "Распадская"},
+		{Ticker: "SIBN", Name: "Газпром нефть"},
+	}
+
+	for _, coin := range defaultCoins {
+		a.instruments["coins"] = append(a.instruments["coins"], coin)
+		a.names[coin] = coin
+		_ = a.storage.SaveInstrument(storage.Instrument{
+			Ticker: coin,
+			Name:   coin,
+			Type:   "coins",
+		})
+	}
+
+	for _, stock := range defaultStocks {
+		a.instruments["stocks"] = append(a.instruments["stocks"], stock.Ticker)
+		a.names[stock.Ticker] = stock.Name
+		_ = a.storage.SaveInstrument(storage.Instrument{
+			Ticker: stock.Ticker,
+			Name:   stock.Name,
+			Type:   "stocks",
+		})
 	}
 }
 
@@ -102,9 +181,16 @@ func containsString(list []string, s string) bool {
 
 func (a *App) Run() error {
 	if err := a.finamClient.Connect(); err != nil {
-		a.showError(fmt.Sprintf("Не удалось подключиться к Finam API: %v", err))
+		a.showError(fmt.Sprintf("Не удалось подключиться: %v", err))
 	} else {
-		a.status.SetText("Finam: OK")
+		a.status.SetText("Готово")
+	}
+
+	for cat, list := range a.instruments {
+		for _, ticker := range list {
+			c, t := cat, ticker
+			go a.updateInstrument(c, t)
+		}
 	}
 
 	sigCh := make(chan os.Signal, 1)
@@ -122,17 +208,16 @@ func (a *App) Run() error {
 }
 
 func (a *App) buildUI() {
-	grid := tview.NewGrid().SetRows(0, 1).SetColumns(0, 0, 0, 0)
+	// Ровно две колонки (по 50% на Монеты и Акции)
+	grid := tview.NewGrid().
+		SetRows(0, 1).
+		SetColumns(0, 0)
 
 	a.tables["coins"] = newTable("Монеты")
 	a.tables["stocks"] = newTable("Акции")
-	a.tables["bonds"] = newTable("Облигации")
-	a.tables["other"] = newTable("Прочее")
 
 	grid.AddItem(a.tables["coins"], 0, 0, 1, 1, 0, 0, true)
 	grid.AddItem(a.tables["stocks"], 0, 1, 1, 1, 0, 0, true)
-	grid.AddItem(a.tables["bonds"], 0, 2, 1, 1, 0, 0, true)
-	grid.AddItem(a.tables["other"], 0, 3, 1, 1, 0, 0, true)
 
 	a.search = tview.NewInputField().
 		SetLabel("Добавить тикер [coins]: ").
@@ -166,7 +251,8 @@ func (a *App) buildUI() {
 	bottom.AddItem(a.status, 14, 0, false)
 	bottom.AddItem(a.searchTimer, 16, 0, false)
 
-	grid.AddItem(bottom, 1, 0, 1, 4, 0, 0, false)
+	// Растягиваем нижнюю панель на 2 колонки
+	grid.AddItem(bottom, 1, 0, 1, 2, 0, 0, false)
 
 	a.pages.AddPage("main", grid, true, true)
 	a.activate(a.activeIndex)
@@ -181,9 +267,26 @@ func (a *App) buildUI() {
 				}
 				a.tviewApp.Stop()
 				return nil
-			case tcell.KeyF5:
-				a.activateNext()
-				return nil
+
+			case tcell.KeyRight:
+				if a.search.HasFocus() && a.search.GetText() == "" {
+					a.activateNext()
+					return nil
+				}
+				if !a.search.HasFocus() {
+					a.activateNext()
+					return nil
+				}
+
+			case tcell.KeyLeft:
+				if a.search.HasFocus() && a.search.GetText() == "" {
+					a.activatePrev()
+					return nil
+				}
+				if !a.search.HasFocus() {
+					a.activatePrev()
+					return nil
+				}
 			}
 			return event
 		})
@@ -212,6 +315,46 @@ func (a *App) activate(i int) {
 func (a *App) activateNext() { a.activate(a.activeIndex + 1) }
 
 func (a *App) activatePrev() { a.activate(a.activeIndex - 1) }
+
+func (a *App) refreshTable(category string) {
+	table := a.tables[category]
+	if table == nil {
+		return
+	}
+
+	type item struct {
+		ticker string
+		name   string
+		vol    float64
+	}
+
+	var items []item
+	for _, t := range a.instruments[category] {
+		items = append(items, item{
+			ticker: t,
+			name:   a.names[t],
+			vol:    a.volatilities[t],
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].vol > items[j].vol
+	})
+
+	rowCount := table.GetRowCount()
+	for r := rowCount - 1; r > 0; r-- {
+		table.RemoveRow(r)
+	}
+
+	for i, it := range items {
+		row := i + 1
+		displayName := it.ticker
+		if it.name != "" && it.name != it.ticker {
+			displayName = fmt.Sprintf("%s (%s)", it.name, it.ticker)
+		}
+		setTableRow(table, row, displayName, it.vol)
+	}
+}
 
 func (a *App) updateInstrument(category, ticker string) {
 	ctx := context.Background()
@@ -251,20 +394,8 @@ func (a *App) updateInstrument(category, ticker string) {
 	_ = a.storage.SaveVolatility(ticker, vol, lastClose)
 
 	a.tviewApp.QueueUpdateDraw(func() {
-		table := a.tables[category]
-		if table == nil {
-			table = a.tables["other"]
-			category = "other"
-		}
-		if a.rows[category] == nil {
-			a.rows[category] = make(map[string]int)
-		}
-		row, ok := a.rows[category][ticker]
-		if !ok {
-			row = table.GetRowCount()
-			a.rows[category][ticker] = row
-		}
-		setTableRow(table, row, ticker, vol)
+		a.volatilities[ticker] = vol
+		a.refreshTable(category)
 		a.status.SetText("Готово")
 	})
 }
@@ -351,7 +482,7 @@ func (a *App) performSearch(query string) {
 				for _, s := range symbols {
 					targetCat := s.Category
 					if targetCat == "" {
-						targetCat = mapFinamTypeToCategory(s.Type)
+						targetCat = cat
 					}
 					results = append(results, SearchResult{
 						Ticker:   s.Ticker,
@@ -382,17 +513,6 @@ func (a *App) performSearch(query string) {
 	}(query, currentCategory)
 }
 
-func mapFinamTypeToCategory(finamType string) string {
-	switch strings.ToUpper(finamType) {
-	case "STOCK", "SHARE":
-		return "stocks"
-	case "BOND":
-		return "bonds"
-	default:
-		return "other"
-	}
-}
-
 func (a *App) showSearchResults(results []SearchResult) {
 	list := tview.NewList().
 		ShowSecondaryText(true)
@@ -404,10 +524,14 @@ func (a *App) showSearchResults(results []SearchResult) {
 
 	for _, r := range results {
 		r := r
-		title := fmt.Sprintf("%s (%s)", r.Ticker, r.Name)
+		title := r.Ticker
+		if r.Name != "" && r.Name != r.Ticker {
+			title = fmt.Sprintf("%s (%s)", r.Name, r.Ticker)
+		}
 		desc := fmt.Sprintf("Категория: %s", r.Category)
 		list.AddItem(title, desc, 0, func() {
-			a.addInstrument(r.Ticker, r.Category)
+			a.names[r.Ticker] = r.Name
+			a.addInstrument(r.Ticker, r.Name, r.Category)
 			a.search.SetText("")
 			a.pages.RemovePage("search_modal")
 			a.tviewApp.SetFocus(a.search)
@@ -424,7 +548,7 @@ func (a *App) showSearchResults(results []SearchResult) {
 	})
 
 	modalGrid := tview.NewGrid().
-		SetColumns(-1, 65, -1).
+		SetColumns(-1, 72, -1).
 		SetRows(-1, 15, -1).
 		AddItem(list, 1, 1, 1, 1, 0, 0, true)
 
@@ -439,6 +563,10 @@ func (a *App) showSearchResults(results []SearchResult) {
 func (a *App) displayErrorModal(msg string) {
 	modal := tview.NewModal().
 		SetText(msg).
+		SetTextColor(tcell.ColorBlack).
+		SetBackgroundColor(tcell.ColorWhiteSmoke).
+		SetButtonTextColor(tcell.ColorWhite).
+		SetButtonBackgroundColor(tcell.ColorDarkBlue).
 		AddButtons([]string{"OK"}).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 			a.pages.RemovePage("error_modal")
@@ -459,9 +587,9 @@ func (a *App) showError(msg string) {
 	})
 }
 
-func (a *App) addInstrument(ticker, category string) {
+func (a *App) addInstrument(ticker, name, category string) {
 	if _, ok := a.tables[category]; !ok {
-		category = "other"
+		return
 	}
 	for _, t := range a.instruments[category] {
 		if t == ticker {
@@ -469,6 +597,7 @@ func (a *App) addInstrument(ticker, category string) {
 		}
 	}
 	a.instruments[category] = append(a.instruments[category], ticker)
-	_ = a.storage.SaveInstrument(storage.Instrument{Ticker: ticker, Name: ticker, Type: category})
+	a.names[ticker] = name
+	_ = a.storage.SaveInstrument(storage.Instrument{Ticker: ticker, Name: name, Type: category})
 	go a.updateInstrument(category, ticker)
 }
