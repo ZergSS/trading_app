@@ -229,25 +229,14 @@ func (a *App) updateInstrument(category, ticker string) {
 
 	switch category {
 	case "coins":
-		var bybitCandles []bybit.Candle
-		bybitCandles, err = a.bybitClient.GetCandles(ctx, ticker, a.cfg.VolatilityPeriod)
-		if err == nil {
-			for _, c := range bybitCandles {
-				candles = append(candles, volatility.Candle{
-					Open:  c.Open,
-					High:  c.High,
-					Low:   c.Low,
-					Close: c.Close,
-				})
-			}
-		}
+		// Bybit клиент сразу возвращает []volatility.Candle
+		candles, err = a.bybitClient.GetCandles(ctx, ticker, a.cfg.VolatilityPeriod)
 	default:
 		var finamCandles []finam.Candle
 		finamCandles, err = a.finamClient.GetCandles(ctx, ticker, a.cfg.VolatilityPeriod)
 		if err == nil {
 			for _, c := range finamCandles {
 				candles = append(candles, volatility.Candle{
-					Open:  c.Open,
 					High:  c.High,
 					Low:   c.Low,
 					Close: c.Close,
@@ -304,35 +293,37 @@ func (a *App) performSearch(query string) {
 	a.searchCancel = cancel
 
 	startedAt := time.Now()
-	a.status.SetText("Поиск")
+	a.status.SetText("Поиск...")
 	a.searchTimer.SetText("Поиск: 0.0s")
 
 	done := make(chan struct{})
+
+	// Таймер теперь не перегружает UI и корректно освобождает поток
 	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
+		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
+			case <-done:
+				return
+			case <-searchCtx.Done():
+				return
 			case <-ticker.C:
 				delta := time.Since(startedAt)
 				a.tviewApp.QueueUpdateDraw(func() {
 					a.searchTimer.SetText(fmt.Sprintf("Поиск: %.1fs", delta.Seconds()))
 				})
-			case <-done:
-				return
-			case <-searchCtx.Done():
-				a.tviewApp.QueueUpdateDraw(func() {
-					a.status.SetText("Отменено")
-					a.searchTimer.SetText("Поиск: 0.0s")
-				})
-				return
 			}
 		}
 	}()
 
 	go func(q string) {
 		defer func() {
-			close(done)
+			select {
+			case <-done:
+			default:
+				close(done)
+			}
 			a.searchCancel = nil
 		}()
 
@@ -351,7 +342,6 @@ func (a *App) performSearch(query string) {
 			symbols, err := a.finamClient.Search(searchCtx, q)
 			if err == nil {
 				for _, s := range symbols {
-					// Преобразуем STOCK / BOND / OTHER к ключам наших таблиц
 					cat := mapFinamTypeToCategory(s.Type)
 					results = append(results, SearchResult{
 						Ticker:   s.Ticker,
@@ -360,6 +350,11 @@ func (a *App) performSearch(query string) {
 					})
 				}
 			}
+		}
+
+		// Если поиск уже был отменён пользователем — не трогаем UI
+		if searchCtx.Err() != nil {
+			return
 		}
 
 		a.tviewApp.QueueUpdateDraw(func() {

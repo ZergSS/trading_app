@@ -2,26 +2,20 @@ package finam
 
 import (
 	"context"
-	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
-
-	assetsPb "github.com/FinamWeb/finam-trade-api/go/grpc/tradeapi/v1/assets"
-	mdPb "github.com/FinamWeb/finam-trade-api/go/grpc/tradeapi/v1/marketdata"
-	"google.golang.org/genproto/googleapis/type/decimal"
-	"google.golang.org/genproto/googleapis/type/interval"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const FinamGRPCTarget = "trade-api.finam.ru:443"
+const FinamRESTBaseURL = "https://trade-api.finam.ru"
 
 type Candle struct {
 	Date  time.Time
-	Open  float64
 	High  float64
 	Low   float64
 	Close float64
@@ -36,10 +30,9 @@ type InstrumentInfo struct {
 }
 
 type Client struct {
-	conn      *grpc.ClientConn
-	token     string
-	marketSvc mdPb.MarketDataServiceClient
-	assetsSvc assetsPb.AssetsServiceClient
+	httpClient *http.Client
+	token      string
+	baseURL    string
 }
 
 func NewClient(token string) (*Client, error) {
@@ -47,72 +40,93 @@ func NewClient(token string) (*Client, error) {
 		return nil, fmt.Errorf("finam token cannot be empty")
 	}
 
-	creds := credentials.NewTLS(&tls.Config{})
-	conn, err := grpc.Dial(FinamGRPCTarget, grpc.WithTransportCredentials(creds))
-	if err != nil {
-		return nil, fmt.Errorf("failed to dial Finam gRPC: %w", err)
-	}
-
 	return &Client{
-		conn:      conn,
-		token:     token,
-		marketSvc: mdPb.NewMarketDataServiceClient(conn),
-		assetsSvc: assetsPb.NewAssetsServiceClient(conn),
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
+		token:   token,
+		baseURL: FinamRESTBaseURL,
 	}, nil
 }
 
-func (c *Client) Close() error {
-	if c.conn != nil {
-		return c.conn.Close()
-	}
+// Connect оставлен для совместимости с app.go
+func (c *Client) Connect() error {
 	return nil
 }
 
-func (c *Client) withAuthContext(ctx context.Context) context.Context {
-	return metadata.NewOutgoingContext(ctx, metadata.Pairs("x-api-key", c.token))
+func (c *Client) Close() error {
+	return nil
 }
 
-func decimalToFloat(d *decimal.Decimal) float64 {
-	if d == nil {
-		return 0
-	}
-	var val float64
-	fmt.Sscanf(d.GetValue(), "%f", &val)
-	return val
+// --- Получение дневных свечей ---
+
+type restBarsResponse struct {
+	Bars []struct {
+		Timestamp string `json:"timestamp"`
+		Open      string `json:"open"`
+		High      string `json:"high"`
+		Low       string `json:"low"`
+		Close     string `json:"close"`
+	} `json:"bars"`
 }
 
-// GetDailyCandles запрашивает дневные свечи
-// symbol может быть тикером (например, "SBER") или полным символом ("SBER@MISX")
 func (c *Client) GetDailyCandles(ctx context.Context, symbol string, count int) ([]Candle, error) {
-	authCtx, cancel := context.WithTimeout(c.withAuthContext(ctx), 10*time.Second)
-	defer cancel()
-
-	// Запрашиваем с запасом на выходные дни
-	startTime := time.Now().AddDate(0, 0, -(count * 3))
-	endTime := time.Now()
-
-	req := &mdPb.BarsRequest{
-		Symbol:    symbol,
-		Timeframe: mdPb.TimeFrame_TIME_FRAME_D,
-		Interval: &interval.Interval{
-			StartTime: timestamppb.New(startTime),
-			EndTime:   timestamppb.New(endTime),
-		},
+	// Если передали чистый тикер без биржи, по умолчанию берем Московскую биржу
+	if !strings.Contains(symbol, "@") {
+		symbol = symbol + "@MISX"
 	}
 
-	resp, err := c.marketSvc.Bars(authCtx, req)
+	from := time.Now().AddDate(0, 0, -(count * 4)).Format(time.RFC3339)
+	to := time.Now().Format(time.RFC3339)
+
+	endpoint := fmt.Sprintf("%s/api/v1/marketdata/bars", c.baseURL)
+	reqURL, err := url.Parse(endpoint)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get bars for %s: %w", symbol, err)
+		return nil, err
+	}
+
+	q := reqURL.Query()
+	q.Set("symbol", symbol)
+	q.Set("timeframe", "TIME_FRAME_D")
+	q.Set("interval.startTime", from)
+	q.Set("interval.endTime", to)
+	reqURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("x-api-key", c.token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("finam api error (code %d): %s", resp.StatusCode, string(body))
+	}
+
+	var data restBarsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	var candles []Candle
-	for _, bar := range resp.GetBars() {
+	for _, b := range data.Bars {
+		t, _ := time.Parse(time.RFC3339, b.Timestamp)
+		high, _ := strconv.ParseFloat(b.High, 64)
+		low, _ := strconv.ParseFloat(b.Low, 64)
+		cls, _ := strconv.ParseFloat(b.Close, 64)
+
 		candles = append(candles, Candle{
-			Date:  bar.GetTimestamp().AsTime(),
-			Open:  decimalToFloat(bar.GetOpen()),
-			High:  decimalToFloat(bar.GetHigh()),
-			Low:   decimalToFloat(bar.GetLow()),
-			Close: decimalToFloat(bar.GetClose()),
+			Date:  t,
+			High:  high,
+			Low:   low,
+			Close: cls,
 		})
 	}
 
@@ -123,39 +137,75 @@ func (c *Client) GetDailyCandles(ctx context.Context, symbol string, count int) 
 	return candles, nil
 }
 
-// SearchInstruments выполняет поиск активов через AssetsService
+// --- Поиск инструментов ---
+
+type restAssetsResponse struct {
+	Assets []struct {
+		Symbol string `json:"symbol"`
+		Ticker string `json:"ticker"`
+		Name   string `json:"name"`
+		Type   string `json:"type"`
+		Mic    string `json:"mic"`
+	} `json:"assets"`
+}
+
 func (c *Client) SearchInstruments(ctx context.Context, query string) ([]InstrumentInfo, error) {
-	authCtx, cancel := context.WithTimeout(c.withAuthContext(ctx), 10*time.Second)
-	defer cancel()
-
-	req := &assetsPb.AssetsRequest{}
-
-	resp, err := c.assetsSvc.Assets(authCtx, req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get assets: %w", err)
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
 	}
 
-	upperQuery := strings.ToUpper(strings.TrimSpace(query))
+	endpoint := fmt.Sprintf("%s/api/v1/assets", c.baseURL)
+	reqURL, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, err
+	}
+
+	// Передаем фильтр в query, чтобы сервер сам отфильтровал список
+	q := reqURL.Query()
+	q.Set("ticker", strings.ToUpper(query))
+	reqURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("x-api-key", c.token)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("finam api error (code %d): %s", resp.StatusCode, string(body))
+	}
+
+	var data restAssetsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, fmt.Errorf("failed to decode assets: %w", err)
+	}
+
 	var results []InstrumentInfo
+	upperQuery := strings.ToUpper(query)
 
-	for _, asset := range resp.GetAssets() {
-		ticker := asset.GetTicker()
-		name := asset.GetName()
-
-		// Фильтрация по тикеру или названию компании
-		if upperQuery != "" && !strings.Contains(strings.ToUpper(ticker), upperQuery) && !strings.Contains(strings.ToUpper(name), upperQuery) {
+	for _, a := range data.Assets {
+		if !strings.Contains(strings.ToUpper(a.Ticker), upperQuery) && !strings.Contains(strings.ToUpper(a.Name), upperQuery) {
 			continue
 		}
 
 		results = append(results, InstrumentInfo{
-			Ticker: ticker,
-			Symbol: asset.GetSymbol(),
-			Name:   name,
-			Mic:    asset.GetMic(),
-			Type:   classifyAsset(asset.GetType()),
+			Ticker: a.Ticker,
+			Symbol: a.Symbol,
+			Name:   a.Name,
+			Mic:    a.Mic,
+			Type:   classifyAsset(a.Type),
 		})
 
-		if len(results) >= 20 {
+		if len(results) >= 15 {
 			break
 		}
 	}
@@ -175,20 +225,11 @@ func classifyAsset(rawType string) string {
 	}
 }
 
-// Connect для совместимости с инициализацией UI
-func (c *Client) Connect() error {
-	if c.conn == nil {
-		return fmt.Errorf("finam grpc connection is not initialized")
-	}
-	return nil
-}
-
-// GetCandles — алиас к GetDailyCandles
+// Алиасы для полной совместимости с app.go
 func (c *Client) GetCandles(ctx context.Context, symbol string, count int) ([]Candle, error) {
 	return c.GetDailyCandles(ctx, symbol, count)
 }
 
-// Search — алиас к SearchInstruments
 func (c *Client) Search(ctx context.Context, query string) ([]InstrumentInfo, error) {
 	return c.SearchInstruments(ctx, query)
 }
