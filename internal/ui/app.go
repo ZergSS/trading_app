@@ -144,7 +144,6 @@ func (a *App) loadSavedInstruments() {
 		{Ticker: "TATNP", Name: "Татнефть преф."},
 		{Ticker: "LSRG", Name: "Группа ЛСР"},
 		{Ticker: "NLMK", Name: "НЛМК"},
-		{Ticker: "POLY", Name: "Полиметалл"},
 		{Ticker: "RASP", Name: "Распадская"},
 		{Ticker: "SIBN", Name: "Газпром нефть"},
 	}
