@@ -1,0 +1,8 @@
+2026/09/25 12:15:37 Поиск 'btcusdt' (категория 'coins'): results=1, err=<nil>
+2026/09/25 12:25:38 Поиск 'btc' (категория 'coins'): results=1, err=<nil>
+2026/09/25 12:29:33 Поиск 'usdt' (категория 'coins'): results=0, err=bybit API error: code 10001: params error: Symbol Is Invalid
+2026/09/25 12:34:29 Поиск 'btcusdt' (категория 'coins'): results=1, err=<nil>
+2026/09/25 12:34:51 Поиск 'sber' (категория 'stocks'): results=1, err=<nil>
+2026/09/25 12:36:35 Поиск 'GAZP' (категория 'stocks'): results=1, err=<nil>
+2026/09/25 12:37:42 Поиск 'RU000A10DQB6' (категория 'bonds'): results=1, err=<nil>
+2026/09/25 12:38:12 Поиск 'eth' (категория 'coins'): results=1, err=<nil>

@@ -4,3 +4,4 @@ excesize.md
 *.db
 /bin/
 AGENT.md
+*.log

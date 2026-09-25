@@ -60,13 +60,10 @@ func NewApp(cfg *config.Config) *App {
 		activeIndex: 0,
 	}
 
-	var err error
-	a.finamClient, err = finam.NewClient(cfg.FinamToken)
-	if err != nil {
-		log.Printf("finam client init error: %v", err)
-	}
+	a.finamClient = finam.NewClient(cfg.FinamToken)
 	a.bybitClient = bybit.NewClient()
 
+	var err error
 	a.storage, err = storage.New(cfg.DBPath)
 	if err != nil {
 		panic(fmt.Sprintf("Ошибка создания хранилища: %v", err))
@@ -104,7 +101,6 @@ func containsString(list []string, s string) bool {
 }
 
 func (a *App) Run() error {
-	// Connect без передачи ctx
 	if err := a.finamClient.Connect(); err != nil {
 		a.showError(fmt.Sprintf("Не удалось подключиться к Finam API: %v", err))
 	} else {
@@ -139,8 +135,8 @@ func (a *App) buildUI() {
 	grid.AddItem(a.tables["other"], 0, 3, 1, 1, 0, 0, true)
 
 	a.search = tview.NewInputField().
-		SetLabel("Добавить тикер: ").
-		SetPlaceholder("например SBER@MISX").
+		SetLabel("Добавить тикер [coins]: ").
+		SetPlaceholder("например BTC или SBER").
 		SetFieldTextColor(tcell.ColorWhite).
 		SetFieldBackgroundColor(tcell.NewRGBColor(12, 28, 38)).
 		SetPlaceholderTextColor(tcell.ColorDarkGray).
@@ -173,7 +169,6 @@ func (a *App) buildUI() {
 	grid.AddItem(bottom, 1, 0, 1, 4, 0, 0, false)
 
 	a.pages.AddPage("main", grid, true, true)
-
 	a.activate(a.activeIndex)
 
 	a.tviewApp.SetRoot(a.pages, true).
@@ -218,10 +213,6 @@ func (a *App) activateNext() { a.activate(a.activeIndex + 1) }
 
 func (a *App) activatePrev() { a.activate(a.activeIndex - 1) }
 
-func (a *App) refreshData() {
-	a.status.SetText("Обновление отключено")
-}
-
 func (a *App) updateInstrument(category, ticker string) {
 	ctx := context.Background()
 	var candles []volatility.Candle
@@ -229,7 +220,6 @@ func (a *App) updateInstrument(category, ticker string) {
 
 	switch category {
 	case "coins":
-		// Bybit клиент сразу возвращает []volatility.Candle
 		candles, err = a.bybitClient.GetCandles(ctx, ticker, a.cfg.VolatilityPeriod)
 	default:
 		var finamCandles []finam.Candle
@@ -279,99 +269,122 @@ func (a *App) updateInstrument(category, ticker string) {
 	})
 }
 
-func (a *App) autoRefresh() {
-	return
-}
-
 func (a *App) performSearch(query string) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return
 	}
 
-	searchCtx, cancel := context.WithCancel(context.Background())
+	if a.searchCancel != nil {
+		a.searchCancel()
+	}
+
+	searchCtx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
 	a.searchCancel = cancel
 
 	startedAt := time.Now()
 	a.status.SetText("Поиск...")
 	a.searchTimer.SetText("Поиск: 0.0s")
 
-	done := make(chan struct{})
+	stopTimer := make(chan struct{})
 
-	// Таймер теперь не перегружает UI и корректно освобождает поток
 	go func() {
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-done:
+			case <-stopTimer:
 				return
 			case <-searchCtx.Done():
 				return
 			case <-ticker.C:
 				delta := time.Since(startedAt)
-				a.tviewApp.QueueUpdateDraw(func() {
+				a.tviewApp.QueueUpdate(func() {
 					a.searchTimer.SetText(fmt.Sprintf("Поиск: %.1fs", delta.Seconds()))
 				})
 			}
 		}
 	}()
 
-	go func(q string) {
+	currentCategory := a.categories[a.activeIndex]
+
+	go func(q string, cat string) {
 		defer func() {
 			select {
-			case <-done:
+			case <-stopTimer:
 			default:
-				close(done)
+				close(stopTimer)
 			}
-			a.searchCancel = nil
+			cancel()
 		}()
 
 		var results []SearchResult
+		var searchErr error
 
-		if a.categories[a.activeIndex] == "coins" {
-			candles, err := a.bybitClient.GetCandles(searchCtx, strings.ToUpper(q), a.cfg.VolatilityPeriod)
-			if err == nil && len(candles) > 0 {
-				results = append(results, SearchResult{
-					Ticker:   strings.ToUpper(q),
-					Name:     q,
-					Category: "coins",
-				})
+		if cat == "coins" {
+			upper := strings.ToUpper(q)
+			var candidates []string
+			if strings.HasSuffix(upper, "USDT") && len(upper) > 4 {
+				candidates = []string{upper}
+			} else {
+				candidates = []string{upper + "USDT", upper}
+			}
+
+			for _, sym := range candidates {
+				candles, err := a.bybitClient.GetCandles(searchCtx, sym, a.cfg.VolatilityPeriod)
+				if err == nil && len(candles) > 0 {
+					results = append(results, SearchResult{
+						Ticker:   sym,
+						Name:     sym,
+						Category: "coins",
+					})
+					break
+				} else if err != nil {
+					searchErr = err
+				}
 			}
 		} else {
 			symbols, err := a.finamClient.Search(searchCtx, q)
-			if err == nil {
+			if err != nil {
+				searchErr = err
+			} else {
 				for _, s := range symbols {
-					cat := mapFinamTypeToCategory(s.Type)
+					targetCat := s.Category
+					if targetCat == "" {
+						targetCat = mapFinamTypeToCategory(s.Type)
+					}
 					results = append(results, SearchResult{
 						Ticker:   s.Ticker,
 						Name:     s.Name,
-						Category: cat,
+						Category: targetCat,
 					})
 				}
 			}
 		}
 
-		// Если поиск уже был отменён пользователем — не трогаем UI
-		if searchCtx.Err() != nil {
-			return
-		}
+		log.Printf("Поиск '%s' (категория '%s'): results=%d, err=%v", q, cat, len(results), searchErr)
 
 		a.tviewApp.QueueUpdateDraw(func() {
 			a.status.SetText("Готово")
 			a.searchTimer.SetText("Поиск: 0.0s")
+
 			if len(results) == 0 {
-				a.showError("Ничего не найдено")
+				errMsg := fmt.Sprintf("Ничего не найдено для '%s'", q)
+				if searchErr != nil {
+					errMsg = fmt.Sprintf("Ошибка: %v", searchErr)
+				}
+				a.displayErrorModal(errMsg)
 				return
 			}
+
 			a.showSearchResults(results)
 		})
-	}(query)
+	}(query, currentCategory)
 }
 
 func mapFinamTypeToCategory(finamType string) string {
 	switch strings.ToUpper(finamType) {
-	case "STOCK":
+	case "STOCK", "SHARE":
 		return "stocks"
 	case "BOND":
 		return "bonds"
@@ -381,33 +394,69 @@ func mapFinamTypeToCategory(finamType string) string {
 }
 
 func (a *App) showSearchResults(results []SearchResult) {
-	list := tview.NewList()
-	list.SetMainTextColor(tcell.ColorBlack)
-	list.SetSecondaryTextColor(tcell.ColorBlack)
-	list.SetBackgroundColor(tcell.ColorWhite)
-	list.SetBorder(true)
-	list.SetTitle("Результаты поиска")
-	list.SetRect(10, 4, 100, 18)
+	list := tview.NewList().
+		ShowSecondaryText(true)
+	list.SetBorder(true).
+		SetTitle(" Результаты поиска (Enter — добавить, Esc — отмена) ").
+		SetTitleColor(tcell.ColorYellow).
+		SetBorderColor(tcell.ColorLightCyan).
+		SetBackgroundColor(tcell.NewRGBColor(24, 28, 40))
+
 	for _, r := range results {
 		r := r
-		list.AddItem(
-			fmt.Sprintf("%s (%s) — %s", r.Ticker, r.Name, r.Category),
-			"", 0,
-			func() {
-				a.addInstrument(r.Ticker, r.Category)
-				a.search.SetText("")
-				a.pages.RemovePage("search")
-				a.tviewApp.SetFocus(a.search)
-			},
-		)
+		title := fmt.Sprintf("%s (%s)", r.Ticker, r.Name)
+		desc := fmt.Sprintf("Категория: %s", r.Category)
+		list.AddItem(title, desc, 0, func() {
+			a.addInstrument(r.Ticker, r.Category)
+			a.search.SetText("")
+			a.pages.RemovePage("search_modal")
+			a.tviewApp.SetFocus(a.search)
+		})
 	}
-	list.AddItem("Отмена", "", 0, func() {
-		a.search.SetText("")
-		a.pages.RemovePage("search")
-		a.tviewApp.SetFocus(a.search)
+
+	list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEscape {
+			a.pages.RemovePage("search_modal")
+			a.tviewApp.SetFocus(a.search)
+			return nil
+		}
+		return event
 	})
 
-	a.pages.AddPage("search", list, true, true)
+	modalGrid := tview.NewGrid().
+		SetColumns(-1, 65, -1).
+		SetRows(-1, 15, -1).
+		AddItem(list, 1, 1, 1, 1, 0, 0, true)
+
+	if a.pages.HasPage("search_modal") {
+		a.pages.RemovePage("search_modal")
+	}
+
+	a.pages.AddPage("search_modal", modalGrid, true, true)
+	a.tviewApp.SetFocus(list)
+}
+
+func (a *App) displayErrorModal(msg string) {
+	modal := tview.NewModal().
+		SetText(msg).
+		AddButtons([]string{"OK"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			a.pages.RemovePage("error_modal")
+			a.tviewApp.SetFocus(a.search)
+		})
+
+	if a.pages.HasPage("error_modal") {
+		a.pages.RemovePage("error_modal")
+	}
+
+	a.pages.AddPage("error_modal", modal, true, true)
+	a.tviewApp.SetFocus(modal)
+}
+
+func (a *App) showError(msg string) {
+	a.tviewApp.QueueUpdateDraw(func() {
+		a.displayErrorModal(msg)
+	})
 }
 
 func (a *App) addInstrument(ticker, category string) {
@@ -422,20 +471,4 @@ func (a *App) addInstrument(ticker, category string) {
 	a.instruments[category] = append(a.instruments[category], ticker)
 	_ = a.storage.SaveInstrument(storage.Instrument{Ticker: ticker, Name: ticker, Type: category})
 	go a.updateInstrument(category, ticker)
-}
-
-func (a *App) showError(msg string) {
-	a.tviewApp.QueueUpdateDraw(func() {
-		modal := tview.NewModal().
-			SetText(msg).
-			SetTextColor(tcell.ColorBlack).
-			SetBackgroundColor(tcell.ColorWhite).
-			SetButtonTextColor(tcell.ColorBlack).
-			AddButtons([]string{"OK"}).
-			SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-				a.pages.RemovePage("error")
-				a.tviewApp.SetFocus(a.search)
-			})
-		a.pages.AddPage("error", modal, true, true)
-	})
 }
