@@ -134,7 +134,7 @@ func (a *App) loadSavedInstruments() {
 		{Ticker: "MOEX", Name: "Московская биржа"},
 		{Ticker: "TCSG", Name: "Т-Банк (Тинькофф)"},
 		{Ticker: "AFKS", Name: "АФК Система"},
-		{Ticker: "FIVE", Name: "X5 Retail Group"},
+		{Ticker: "X5", Name: "КЦ ИКС 5"},
 		{Ticker: "HYDR", Name: "РусГидро"},
 		{Ticker: "RUAL", Name: "Русал"},
 		{Ticker: "SNGSP", Name: "Сургутнефтегаз преф."},
