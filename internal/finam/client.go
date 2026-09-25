@@ -1,311 +1,176 @@
 package finam
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"crypto/tls"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
-	"trade_info/internal/volatility"
+	assetsPb "github.com/FinamWeb/finam-trade-api/go/grpc/tradeapi/v1/assets"
+	mdPb "github.com/FinamWeb/finam-trade-api/go/grpc/tradeapi/v1/marketdata"
+	"google.golang.org/genproto/googleapis/type/decimal"
+	"google.golang.org/genproto/googleapis/type/interval"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
-const (
-	baseURL          = "https://api.finam.ru"
-	sourceAppID      = "traiding_app"
-	maxSearchResults = 10
-	maxSearchPages   = 12
-	extraDaysBuffer  = 7
-	maxErrorBody     = 500
-	searchTimeout    = 7 * time.Second
-)
+const FinamGRPCTarget = "trade-api.finam.ru:443"
 
-// Client — клиент Finam Trade API (REST).
+type Candle struct {
+	Date  time.Time
+	Open  float64
+	High  float64
+	Low   float64
+	Close float64
+}
+
+type InstrumentInfo struct {
+	Ticker string
+	Symbol string
+	Name   string
+	Mic    string
+	Type   string // STOCK, BOND, OTHER
+}
+
 type Client struct {
-	secret     string
-	token      string
-	httpClient *http.Client
+	conn      *grpc.ClientConn
+	token     string
+	marketSvc mdPb.MarketDataServiceClient
+	assetsSvc assetsPb.AssetsServiceClient
 }
 
-func NewClient(secret string) *Client {
+func NewClient(token string) (*Client, error) {
+	if token == "" {
+		return nil, fmt.Errorf("finam token cannot be empty")
+	}
+
+	creds := credentials.NewTLS(&tls.Config{})
+	conn, err := grpc.Dial(FinamGRPCTarget, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial Finam gRPC: %w", err)
+	}
+
 	return &Client{
-		secret:     secret,
-		httpClient: &http.Client{Timeout: 15 * time.Second},
-	}
+		conn:      conn,
+		token:     token,
+		marketSvc: mdPb.NewMarketDataServiceClient(conn),
+		assetsSvc: assetsPb.NewAssetsServiceClient(conn),
+	}, nil
 }
 
-// decimalValue — цена/объём в формате {"value": "123.45"}.
-type decimalValue struct {
-	Value string `json:"value"`
-}
-
-func (d decimalValue) Float() float64 {
-	v, err := strconv.ParseFloat(d.Value, 64)
-	if err != nil {
-		return 0
-	}
-	return v
-}
-
-// Connect получает JWT-токен по секрету (POST /v1/sessions).
-func (c *Client) Connect(ctx context.Context) error {
-	body, err := json.Marshal(map[string]string{
-		"secret":        c.secret,
-		"source_app_id": sourceAppID,
-	})
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/sessions", bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("авторизация Finam: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("авторизация Finam: статус %d: %s", resp.StatusCode, truncate(b))
-	}
-
-	var out struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return fmt.Errorf("авторизация Finam: %w", err)
-	}
-
-	c.token = out.Token
-	if c.token == "" {
-		return fmt.Errorf("авторизация Finam: пустой токен")
+func (c *Client) Close() error {
+	if c.conn != nil {
+		return c.conn.Close()
 	}
 	return nil
 }
 
-// GetCandles возвращает N последних дневных свечей по символу вида тикер@мик.
-func (c *Client) GetCandles(ctx context.Context, symbol string, count int) ([]volatility.Candle, error) {
-	if c.token == "" {
-		return nil, fmt.Errorf("finam client not authenticated")
+func (c *Client) withAuthContext(ctx context.Context) context.Context {
+	return metadata.NewOutgoingContext(ctx, metadata.Pairs("x-api-key", c.token))
+}
+
+func decimalToFloat(d *decimal.Decimal) float64 {
+	if d == nil {
+		return 0
+	}
+	var val float64
+	fmt.Sscanf(d.GetValue(), "%f", &val)
+	return val
+}
+
+// GetDailyCandles запрашивает дневные свечи
+// symbol может быть тикером (например, "SBER") или полным символом ("SBER@MISX")
+func (c *Client) GetDailyCandles(ctx context.Context, symbol string, count int) ([]Candle, error) {
+	authCtx, cancel := context.WithTimeout(c.withAuthContext(ctx), 10*time.Second)
+	defer cancel()
+
+	// Запрашиваем с запасом на выходные дни
+	startTime := time.Now().AddDate(0, 0, -(count * 3))
+	endTime := time.Now()
+
+	req := &mdPb.BarsRequest{
+		Symbol:    symbol,
+		Timeframe: mdPb.TimeFrame_TIME_FRAME_D,
+		Interval: &interval.Interval{
+			StartTime: timestamppb.New(startTime),
+			EndTime:   timestamppb.New(endTime),
+		},
 	}
 
-	end := time.Now()
-	start := end.AddDate(0, 0, -(count + extraDaysBuffer))
-	u := fmt.Sprintf("%s/v1/instruments/%s/bars?timeframe=%s&interval.start_time=%s&interval.end_time=%s",
-		baseURL, url.PathEscape(symbol), "TIME_FRAME_D",
-		start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
-
-	var out struct {
-		Bars []struct {
-			High  decimalValue `json:"high"`
-			Low   decimalValue `json:"low"`
-			Close decimalValue `json:"close"`
-		} `json:"bars"`
-	}
-	if err := c.doJSON(ctx, http.MethodGet, u, nil, &out); err != nil {
-		return nil, fmt.Errorf("finam bars %s: %w", symbol, err)
+	resp, err := c.marketSvc.Bars(authCtx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get bars for %s: %w", symbol, err)
 	}
 
-	bars := out.Bars
-	if len(bars) == 0 {
-		return nil, fmt.Errorf("нет свечей для %s", symbol)
-	}
-	if len(bars) > count {
-		bars = bars[len(bars)-count:]
-	}
-
-	candles := make([]volatility.Candle, 0, len(bars))
-	for _, b := range bars {
-		candles = append(candles, volatility.Candle{
-			High:  b.High.Float(),
-			Low:   b.Low.Float(),
-			Close: b.Close.Float(),
+	var candles []Candle
+	for _, bar := range resp.GetBars() {
+		candles = append(candles, Candle{
+			Date:  bar.GetTimestamp().AsTime(),
+			Open:  decimalToFloat(bar.GetOpen()),
+			High:  decimalToFloat(bar.GetHigh()),
+			Low:   decimalToFloat(bar.GetLow()),
+			Close: decimalToFloat(bar.GetClose()),
 		})
+	}
+
+	if len(candles) > count {
+		candles = candles[len(candles)-count:]
 	}
 
 	return candles, nil
 }
 
-// Search ищет инструменты по тикеру или названию (GET /v1/assets/all).
-func normalizeFinamQuery(raw string) []string {
-	query := strings.TrimSpace(raw)
-	if query == "" {
-		return nil
-	}
-
-	query = strings.ToUpper(query)
-	query = strings.ReplaceAll(query, "@MOEIX", "@MOEX")
-	query = strings.ReplaceAll(query, "@MOEX.", "@MOEX")
-
-	if strings.Contains(query, "@") || strings.Contains(query, ":") || strings.Contains(query, "/") {
-		return []string{query}
-	}
-
-	return []string{query + "@TQBR", query + "@MOEX", query}
-}
-
-func (c *Client) Search(ctx context.Context, query string) ([]Symbol, error) {
-	if c.token == "" {
-		return nil, fmt.Errorf("finam client not authenticated")
-	}
-
-	candidates := normalizeFinamQuery(query)
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-
-	searchCtx, cancel := context.WithTimeout(ctx, searchTimeout)
+// SearchInstruments выполняет поиск активов через AssetsService
+func (c *Client) SearchInstruments(ctx context.Context, query string) ([]InstrumentInfo, error) {
+	authCtx, cancel := context.WithTimeout(c.withAuthContext(ctx), 10*time.Second)
 	defer cancel()
 
-	var results []Symbol
-	seen := make(map[string]bool)
-	cursor := ""
+	req := &assetsPb.AssetsRequest{}
 
-	for page := 0; page < maxSearchPages && len(results) < maxSearchResults; page++ {
-		u := baseURL + "/v1/assets/all?only_active=true"
-		if cursor != "" {
-			u += "&cursor=" + url.QueryEscape(cursor)
+	resp, err := c.assetsSvc.Assets(authCtx, req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get assets: %w", err)
+	}
+
+	upperQuery := strings.ToUpper(strings.TrimSpace(query))
+	var results []InstrumentInfo
+
+	for _, asset := range resp.GetAssets() {
+		ticker := asset.GetTicker()
+		name := asset.GetName()
+
+		// Фильтрация по тикеру или названию компании
+		if upperQuery != "" && !strings.Contains(strings.ToUpper(ticker), upperQuery) && !strings.Contains(strings.ToUpper(name), upperQuery) {
+			continue
 		}
 
-		var out struct {
-			Assets     []asset `json:"assets"`
-			NextCursor string  `json:"next_cursor"`
-		}
-		if err := c.doJSON(searchCtx, http.MethodGet, u, nil, &out); err != nil {
-			if searchCtx.Err() != nil {
-				return results, fmt.Errorf("finam search timeout: %w", searchCtx.Err())
-			}
-			return results, fmt.Errorf("finam search: %w", err)
-		}
+		results = append(results, InstrumentInfo{
+			Ticker: ticker,
+			Symbol: asset.GetSymbol(),
+			Name:   name,
+			Mic:    asset.GetMic(),
+			Type:   classifyAsset(asset.GetType()),
+		})
 
-		for _, a := range out.Assets {
-			if len(results) >= maxSearchResults {
-				break
-			}
-			if a.IsArchived || a.Symbol == "" {
-				continue
-			}
-
-			assetSymbol := strings.ToUpper(a.Symbol)
-			assetTicker := strings.ToUpper(a.Ticker)
-			matched := false
-			for _, candidate := range candidates {
-				candidate = strings.ToUpper(candidate)
-				if candidate == "" {
-					continue
-				}
-				if assetSymbol == candidate || assetTicker == candidate || strings.Contains(assetSymbol, candidate) || strings.Contains(assetTicker, candidate) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				assetName := strings.ToUpper(a.Name)
-				for _, candidate := range candidates {
-					candidate = strings.ToUpper(candidate)
-					if strings.Contains(assetName, candidate) || strings.Contains(assetName, strings.TrimSuffix(candidate, "@MOEX")) || strings.Contains(assetName, strings.TrimSuffix(candidate, "@TQBR")) {
-						matched = true
-						break
-					}
-				}
-			}
-			if !matched {
-				continue
-			}
-
-			if seen[a.Symbol] {
-				continue
-			}
-			seen[a.Symbol] = true
-			results = append(results, Symbol{
-				Ticker:   a.Symbol,
-				Name:     a.Name,
-				Category: categoryFromType(a.Type),
-			})
-			if len(results) >= maxSearchResults {
-				break
-			}
-		}
-
-		if out.NextCursor == "" || out.NextCursor == cursor {
+		if len(results) >= 20 {
 			break
 		}
-		cursor = out.NextCursor
 	}
 
 	return results, nil
 }
 
-type asset struct {
-	Symbol     string `json:"symbol"`
-	Ticker     string `json:"ticker"`
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	IsArchived bool   `json:"is_archived"`
-}
-
-// doJSON выполняет запрос с JWT в заголовке Authorization и декодирует ответ.
-func (c *Client) doJSON(ctx context.Context, method, u string, body []byte, out interface{}) error {
-	var rdr io.Reader
-	if body != nil {
-		rdr = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", c.token)
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("статус %d: %s", resp.StatusCode, truncate(b))
-	}
-
-	return json.NewDecoder(resp.Body).Decode(out)
-}
-
-func truncate(b []byte) string {
-	s := strings.TrimSpace(string(b))
-	if len(s) > maxErrorBody {
-		s = s[:maxErrorBody] + "..."
-	}
-	return s
-}
-
-// categoryFromType сопоставляет тип инструмента Finam с категорией таблицы.
-func categoryFromType(t string) string {
-	switch t = strings.ToUpper(t); {
-	case strings.Contains(t, "BOND"):
-		return "bonds"
-	case strings.Contains(t, "STOCK"), strings.Contains(t, "SHARE"):
-		return "stocks"
+func classifyAsset(rawType string) string {
+	raw := strings.ToUpper(rawType)
+	switch {
+	case strings.Contains(raw, "STOCK") || strings.Contains(raw, "SHARE") || raw == "EQ":
+		return "STOCK"
+	case strings.Contains(raw, "BOND"):
+		return "BOND"
 	default:
-		return "other"
+		return "OTHER"
 	}
-}
-
-// Symbol — инструмент Finam.
-type Symbol struct {
-	Ticker   string
-	Name     string
-	Category string
 }

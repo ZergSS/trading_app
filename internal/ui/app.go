@@ -142,7 +142,7 @@ func (a *App) buildUI() {
 
 	a.search = tview.NewInputField().
 		SetLabel("Добавить тикер: ").
-		SetPlaceholder("например SBER@TQBR").
+		SetPlaceholder("например SBER@MISX").
 		SetFieldTextColor(tcell.ColorWhite).
 		SetFieldBackgroundColor(tcell.NewRGBColor(12, 28, 38)).
 		SetPlaceholderTextColor(tcell.ColorDarkGray).
@@ -366,12 +366,14 @@ func (a *App) showSearchResults(results []SearchResult) {
 			"", 0,
 			func() {
 				a.addInstrument(r.Ticker, r.Category)
+				a.search.SetText("")
 				a.pages.RemovePage("search")
 				a.tviewApp.SetFocus(a.search)
 			},
 		)
 	}
 	list.AddItem("Отмена", "", 0, func() {
+		a.search.SetText("")
 		a.pages.RemovePage("search")
 		a.tviewApp.SetFocus(a.search)
 	})
